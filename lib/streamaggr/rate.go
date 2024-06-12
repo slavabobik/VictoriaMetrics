@@ -2,53 +2,48 @@ package streamaggr
 
 import (
 	"sync"
-	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 )
 
 // rateAggrState calculates output=rate, e.g. the counter per-second change.
 type rateAggrState struct {
-	m sync.Map
-
+	m      sync.Map
 	suffix string
-
-	// Time series state is dropped if no new samples are received during stalenessSecs.
-	stalenessSecs uint64
 }
 
 type rateStateValue struct {
-	mu             sync.Mutex
-	lastValues     map[string]rateLastValueState
-	deleteDeadline uint64
+	mu sync.Mutex
+
+	// prevTimestamp stores timestamp of the last registered value
+	// in the previous aggregation interval
+	prevTimestamp  map[string]int64
+	state          [aggrStateSize]rateState
 	deleted        bool
+	deleteDeadline int64
+}
+
+type rateState struct {
+	lastValues map[string]rateLastValueState
 }
 
 type rateLastValueState struct {
 	value          float64
 	timestamp      int64
-	deleteDeadline uint64
+	deleteDeadline int64
 
 	// total stores cumulative difference between registered values
 	// in the aggregation interval
 	total float64
-	// prevTimestamp stores timestamp of the last registered value
-	// in the previous aggregation interval
-	prevTimestamp int64
 }
 
-func newRateAggrState(stalenessInterval time.Duration, suffix string) *rateAggrState {
-	stalenessSecs := roundDurationToSecs(stalenessInterval)
+func newRateAggrState(suffix string) *rateAggrState {
 	return &rateAggrState{
-		suffix:        suffix,
-		stalenessSecs: stalenessSecs,
+		suffix: suffix,
 	}
 }
 
-func (as *rateAggrState) pushSamples(samples []pushSample) {
-	currentTime := fasttime.UnixTimestamp()
-	deleteDeadline := currentTime + as.stalenessSecs
+func (as *rateAggrState) pushSamples(samples []pushSample, deleteDeadline int64, idx int) {
 	for i := range samples {
 		s := &samples[i]
 		inputKey, outputKey := getInputOutputKey(s.key)
@@ -57,9 +52,15 @@ func (as *rateAggrState) pushSamples(samples []pushSample) {
 		v, ok := as.m.Load(outputKey)
 		if !ok {
 			// The entry is missing in the map. Try creating it.
-			v = &rateStateValue{
-				lastValues: make(map[string]rateLastValueState),
+			rsv := &rateStateValue{
+				prevTimestamp: make(map[string]int64),
 			}
+			for r := range rsv.state {
+				rsv.state[r] = rateState{
+					lastValues: make(map[string]rateLastValueState),
+				}
+			}
+			v = rsv
 			outputKey = bytesutil.InternString(outputKey)
 			vNew, loaded := as.m.LoadOrStore(outputKey, v)
 			if loaded {
@@ -71,15 +72,15 @@ func (as *rateAggrState) pushSamples(samples []pushSample) {
 		sv.mu.Lock()
 		deleted := sv.deleted
 		if !deleted {
-			lv, ok := sv.lastValues[inputKey]
+			lv, ok := sv.state[idx].lastValues[inputKey]
 			if ok {
 				if s.timestamp < lv.timestamp {
 					// Skip out of order sample
 					sv.mu.Unlock()
 					continue
 				}
-				if lv.prevTimestamp == 0 {
-					lv.prevTimestamp = lv.timestamp
+				if _, ok = sv.prevTimestamp[inputKey]; !ok {
+					sv.prevTimestamp[inputKey] = lv.timestamp
 				}
 				if s.value >= lv.value {
 					lv.total += s.value - lv.value
@@ -93,7 +94,7 @@ func (as *rateAggrState) pushSamples(samples []pushSample) {
 			lv.deleteDeadline = deleteDeadline
 
 			inputKey = bytesutil.InternString(inputKey)
-			sv.lastValues[inputKey] = lv
+			sv.state[idx].lastValues[inputKey] = lv
 			sv.deleteDeadline = deleteDeadline
 		}
 		sv.mu.Unlock()
@@ -105,17 +106,14 @@ func (as *rateAggrState) pushSamples(samples []pushSample) {
 	}
 }
 
-func (as *rateAggrState) flushState(ctx *flushCtx, _ bool) {
-	currentTime := fasttime.UnixTimestamp()
-	currentTimeMsec := int64(currentTime) * 1000
-
+func (as *rateAggrState) flushState(ctx *flushCtx, flushTimestamp int64, idx int) {
 	m := &as.m
 	m.Range(func(k, v interface{}) bool {
 		sv := v.(*rateStateValue)
 		sv.mu.Lock()
 
 		// check for stale entries
-		deleted := currentTime > sv.deleteDeadline
+		deleted := flushTimestamp > sv.deleteDeadline
 		if deleted {
 			// Mark the current entry as deleted
 			sv.deleted = deleted
@@ -124,25 +122,26 @@ func (as *rateAggrState) flushState(ctx *flushCtx, _ bool) {
 			return true
 		}
 
-		// Delete outdated entries in sv.lastValues
+		// Delete outdated entries in state
 		var rate float64
-		lvs := sv.lastValues
-		for k1, v1 := range lvs {
-			if currentTime > v1.deleteDeadline {
-				delete(lvs, k1)
+		state := sv.state[idx]
+		for k1, v1 := range state.lastValues {
+			if flushTimestamp > v1.deleteDeadline {
+				delete(state.lastValues, k1)
 				continue
-			}
-			rateInterval := v1.timestamp - v1.prevTimestamp
-			if v1.prevTimestamp > 0 && rateInterval > 0 {
-				// calculate rate only if value was seen at least twice with different timestamps
-				rate += v1.total * 1000 / float64(rateInterval)
-				v1.prevTimestamp = v1.timestamp
-				v1.total = 0
-				lvs[k1] = v1
+			} else if prevTimestamp, ok := sv.prevTimestamp[k1]; ok {
+				rateInterval := v1.timestamp - prevTimestamp
+				if prevTimestamp > 0 && rateInterval > 0 {
+					// calculate rate only if value was seen at least twice with different timestamps
+					rate += v1.total * 1000 / float64(rateInterval)
+					sv.prevTimestamp[k1] = v1.timestamp
+					v1.total = 0
+					state.lastValues[k1] = v1
+				}
 			}
 		}
 		// capture m length after deleted items were removed
-		totalItems := len(lvs)
+		totalItems := len(state.lastValues)
 		sv.mu.Unlock()
 
 		if as.suffix == "rate_avg" && totalItems > 0 {
@@ -150,7 +149,7 @@ func (as *rateAggrState) flushState(ctx *flushCtx, _ bool) {
 		}
 
 		key := k.(string)
-		ctx.appendSeries(key, as.suffix, currentTimeMsec, rate)
+		ctx.appendSeries(key, as.suffix, flushTimestamp, rate)
 		return true
 	})
 }
