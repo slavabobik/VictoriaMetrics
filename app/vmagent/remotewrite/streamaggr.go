@@ -50,7 +50,7 @@ var (
 	streamAggrIgnoreOldSamples = flagutil.NewArrayBool("remoteWrite.streamAggr.ignoreOldSamples", "Whether to ignore input samples with old timestamps outside the current "+
 		"aggregation interval for the corresponding -remoteWrite.streamAggr.config . "+
 		"See https://docs.victoriametrics.com/stream-aggregation/#ignoring-old-samples")
-	streamAggrIgnoreFirstIntervals = flag.Int("remoteWrite.streamAggr.ignoreFirstIntervals", 0, "Number of aggregation intervals to skip after the start. Increase this value if "+
+	streamAggrIgnoreFirstIntervals = flagutil.NewArrayInt("remoteWrite.streamAggr.ignoreFirstIntervals", 0, "Number of aggregation intervals to skip after the start. Increase this value if "+
 		"you observe incorrect aggregation results after vmagent restarts. It could be caused by receiving unordered delayed data from clients pushing data into the vmagent. "+
 		"See https://docs.victoriametrics.com/stream-aggregation/#ignore-aggregation-intervals-on-start")
 	streamAggrDropInputLabels = flagutil.NewArrayString("remoteWrite.streamAggr.dropInputLabels", "An optional list of labels to drop from samples "+
@@ -132,13 +132,17 @@ func getStreamAggrOpts(idx int) (string, *streamaggr.Options) {
 			DropInputLabels:      *streamAggrGlobalDropInputLabels,
 			IgnoreOldSamples:     *streamAggrGlobalIgnoreOldSamples,
 			IgnoreFirstIntervals: *streamAggrGlobalIgnoreFirstIntervals,
+			KeepInput:            *streamAggrGlobalKeepInput,
+			DropInput:            *streamAggrGlobalDropInput,
 		}
 	}
 	opts := streamaggr.Options{
 		DedupInterval:        streamAggrDedupInterval.GetOptionalArg(idx),
 		DropInputLabels:      *streamAggrDropInputLabels,
 		IgnoreOldSamples:     streamAggrIgnoreOldSamples.GetOptionalArg(idx),
-		IgnoreFirstIntervals: *streamAggrIgnoreFirstIntervals,
+		IgnoreFirstIntervals: streamAggrIgnoreFirstIntervals.GetOptionalArg(idx),
+		KeepInput:            streamAggrKeepInput.GetOptionalArg(idx),
+		DropInput:            streamAggrDropInput.GetOptionalArg(idx),
 	}
 	if len(*streamAggrConfig) == 0 {
 		return "", &opts

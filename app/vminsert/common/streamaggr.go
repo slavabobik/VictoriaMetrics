@@ -62,6 +62,8 @@ func CheckStreamAggrConfig() error {
 		DropInputLabels:      *streamAggrDropInputLabels,
 		IgnoreOldSamples:     *streamAggrIgnoreOldSamples,
 		IgnoreFirstIntervals: *streamAggrIgnoreFirstIntervals,
+		KeepInput:            *streamAggrKeepInput,
+		DropInput:            *streamAggrDropInput,
 	}
 	sas, err := streamaggr.LoadFromFile(*streamAggrConfig, pushNoop, opts)
 	if err != nil {
@@ -96,6 +98,8 @@ func InitStreamAggr() {
 		DropInputLabels:      *streamAggrDropInputLabels,
 		IgnoreOldSamples:     *streamAggrIgnoreOldSamples,
 		IgnoreFirstIntervals: *streamAggrIgnoreFirstIntervals,
+		KeepInput:            *streamAggrKeepInput,
+		DropInput:            *streamAggrDropInput,
 	}
 	sas, err := streamaggr.LoadFromFile(*streamAggrConfig, pushAggregateSeries, opts)
 	if err != nil {
@@ -130,6 +134,8 @@ func reloadStreamAggrConfig() {
 		DropInputLabels:      *streamAggrDropInputLabels,
 		IgnoreOldSamples:     *streamAggrIgnoreOldSamples,
 		IgnoreFirstIntervals: *streamAggrIgnoreFirstIntervals,
+		KeepInput:            *streamAggrKeepInput,
+		DropInput:            *streamAggrDropInput,
 	}
 	sasNew, err := streamaggr.LoadFromFile(*streamAggrConfig, pushAggregateSeries, opts)
 	if err != nil {
@@ -159,10 +165,8 @@ func MustStopStreamAggr() {
 	sas := sasGlobal.Swap(nil)
 	sas.MustStop()
 
-	if deduplicator != nil {
-		deduplicator.MustStop()
-		deduplicator = nil
-	}
+	deduplicator.MustStop()
+	deduplicator = nil
 }
 
 type streamAggrCtx struct {
@@ -186,12 +190,13 @@ func (ctx *streamAggrCtx) Reset() {
 	ctx.buf = ctx.buf[:0]
 }
 
-func (ctx *streamAggrCtx) push(mrs []storage.MetricRow, matchIdxs []byte) []byte {
+func (ctx *streamAggrCtx) push(insertCtx *InsertCtx) {
 	mn := &ctx.mn
 	tss := ctx.tss
 	labels := ctx.labels
 	samples := ctx.samples
 	buf := ctx.buf
+	mrs := insertCtx.mrs
 
 	tssLen := len(tss)
 	for _, mr := range mrs {
@@ -243,18 +248,16 @@ func (ctx *streamAggrCtx) push(mrs []storage.MetricRow, matchIdxs []byte) []byte
 
 	sas := sasGlobal.Load()
 	if sas.IsEnabled() {
-		matchIdxs = sas.Push(tss, matchIdxs)
+		_ = sas.PushWithCallback(tss, func(matchIdxs []byte) {
+			insertCtx.dropAggregatedRows(matchIdxs)
+		})
 	} else if deduplicator != nil {
-		matchIdxs = bytesutil.ResizeNoCopyMayOverallocate(matchIdxs, len(tss))
-		for i := range matchIdxs {
-			matchIdxs[i] = 1
-		}
 		deduplicator.Push(tss)
+		mrs = mrs[:0]
 	}
 
 	ctx.Reset()
-
-	return matchIdxs
+	insertCtx.mrs = mrs
 }
 
 func pushAggregateSeries(tss []prompbmarshal.TimeSeries) {

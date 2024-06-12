@@ -133,6 +133,14 @@ type Options struct {
 	//
 	// This option can be overridden individually per each aggregation via ignore_first_intervals option.
 	IgnoreFirstIntervals int
+
+	// KeepInput defines whether to keep all the input samples after the aggregation.
+	// By default, only aggregates samples are dropped, while the remaining samples are written to remote storages write.
+	KeepInput bool
+
+	// DropInput defines whether to drop all the input samples after the aggregation.
+	// By default, only aggregates samples are dropped, while the remaining samples are written to remote storages write.
+	DropInput bool
 }
 
 // Config is a configuration for a single stream aggregation.
@@ -230,6 +238,10 @@ type Config struct {
 	// OutputRelabelConfigs is an optional relabeling rules, which are applied
 	// on the aggregated output before being sent to remote storage.
 	OutputRelabelConfigs []promrelabel.RelabelConfig `yaml:"output_relabel_configs,omitempty"`
+
+	// KeepInput defines whether to keep all the input samples after the aggregation.
+	// By default, only aggregates samples are dropped, while the remaining samples are written to remote storages write.
+	KeepInput *bool `yaml:"keep_input,omitempty"`
 }
 
 // Aggregators aggregates metrics passed to Push and calls pushFunc for aggregated data.
@@ -241,6 +253,8 @@ type Aggregators struct {
 	configData []byte
 
 	ms *metrics.Set
+
+	dropInput bool
 }
 
 func newAggregatorsFromData(data []byte, pushFunc PushFunc, opts *Options) (*Aggregators, error) {
@@ -287,11 +301,15 @@ func newAggregatorsFromData(data []byte, pushFunc PushFunc, opts *Options) (*Agg
 	})
 
 	metrics.RegisterSet(ms)
-	return &Aggregators{
+	a := &Aggregators{
 		as:         as,
 		configData: configData,
 		ms:         ms,
-	}, nil
+	}
+	if opts != nil {
+		a.dropInput = opts.DropInput
+	}
+	return a, nil
 }
 
 // IsEnabled returns true if Aggregators has at least one configured aggregator
@@ -320,6 +338,19 @@ func (a *Aggregators) MustStop() {
 	a.as = nil
 }
 
+// ExpectModifications returns true if Push modifies original timeseries
+func (a *Aggregators) ExpectModifications() bool {
+	if a == nil {
+		return false
+	}
+	for _, aggr := range a.as {
+		if aggr.keepInput {
+			return true
+		}
+	}
+	return false
+}
+
 // Equal returns true if a and b are initialized from identical configs.
 func (a *Aggregators) Equal(b *Aggregators) bool {
 	if a == nil || b == nil {
@@ -328,28 +359,39 @@ func (a *Aggregators) Equal(b *Aggregators) bool {
 	return string(a.configData) == string(b.configData)
 }
 
-// Push pushes tss to a.
+// Push calls PushWithCallback with an empty default callback
+func (a *Aggregators) Push(tss []prompbmarshal.TimeSeries) []prompbmarshal.TimeSeries {
+	defaultCallback := func(_ []byte) {}
+	return a.PushWithCallback(tss, defaultCallback)
+}
+
+// PushWithCallback pushes tss to a.
 //
-// Push sets matchIdxs[idx] to 1 if the corresponding tss[idx] was used in aggregations.
+// PushWithCallback calls callback with matchIdxs, where matchIdx[idx] is set to 1 if the corresponding tss[idx] was used in aggregations.
 // Otherwise matchIdxs[idx] is set to 0.
 //
-// Push returns matchIdxs with len equal to len(tss).
-// It re-uses the matchIdxs if it has enough capacity to hold len(tss) items.
-// Otherwise it allocates new matchIdxs.
-func (a *Aggregators) Push(tss []prompbmarshal.TimeSeries, matchIdxs []byte) []byte {
-	matchIdxs = bytesutil.ResizeNoCopyMayOverallocate(matchIdxs, len(tss))
-	for i := range matchIdxs {
-		matchIdxs[i] = 0
-	}
+// Push returns modified timeseries.
+func (a *Aggregators) PushWithCallback(tss []prompbmarshal.TimeSeries, callback func([]byte)) []prompbmarshal.TimeSeries {
 	if a == nil {
-		return matchIdxs
+		return tss
 	}
-
+	matchIdxs := matchIdxsPool.Get()
+	defer matchIdxsPool.Put(matchIdxs)
 	for _, aggr := range a.as {
-		aggr.Push(tss, matchIdxs)
+		matchIdxs.B = bytesutil.ResizeNoCopyMayOverallocate(matchIdxs.B, len(tss))
+		for i := range matchIdxs.B {
+			matchIdxs.B[i] = 0
+		}
+		aggr.Push(tss, matchIdxs.B)
+		if !aggr.keepInput {
+			callback(matchIdxs.B)
+			tss = dropAggregatedSeries(tss, matchIdxs.B)
+		}
 	}
-
-	return matchIdxs
+	if a.dropInput {
+		tss = tss[:0]
+	}
+	return tss
 }
 
 // aggregator aggregates input series according to the config passed to NewAggregator
@@ -363,6 +405,7 @@ type aggregator struct {
 
 	keepMetricNames  bool
 	ignoreOldSamples bool
+	keepInput        bool
 
 	by                  []string
 	without             []string
@@ -512,6 +555,12 @@ func newAggregator(cfg *Config, pushFunc PushFunc, ms *metrics.Set, opts *Option
 		ignoreFirstIntervals = *v
 	}
 
+	// check cfg.KeepInput
+	keepInput := opts.KeepInput
+	if v := cfg.KeepInput; v != nil {
+		keepInput = *v
+	}
+
 	// initialize outputs list
 	if len(cfg.Outputs) == 0 {
 		return nil, fmt.Errorf("`outputs` list must contain at least a single entry from the list %s; "+
@@ -604,6 +653,7 @@ func newAggregator(cfg *Config, pushFunc PushFunc, ms *metrics.Set, opts *Option
 
 		keepMetricNames:  keepMetricNames,
 		ignoreOldSamples: ignoreOldSamples,
+		keepInput:        keepInput,
 
 		by:                  by,
 		without:             without,
@@ -806,7 +856,7 @@ func (a *aggregator) MustStop() {
 	a.wg.Wait()
 }
 
-// Push pushes tss to a.
+// push pushes tss to a.
 func (a *aggregator) Push(tss []prompbmarshal.TimeSeries, matchIdxs []byte) {
 	now := time.Now().UnixMilli()
 	ctx := getPushCtx()
@@ -968,6 +1018,8 @@ func putPushCtx(ctx *pushCtx) {
 	ctx.reset()
 	pushCtxPool.Put(ctx)
 }
+
+var matchIdxsPool bytesutil.ByteBufferPool
 
 var pushCtxPool sync.Pool
 
@@ -1178,6 +1230,19 @@ func sortAndRemoveDuplicates(a []string) []string {
 			dst = append(dst, v)
 		}
 	}
+	return dst
+}
+
+func dropAggregatedSeries(src []prompbmarshal.TimeSeries, matchIdxs []byte) []prompbmarshal.TimeSeries {
+	dst := src[:0]
+	for i, match := range matchIdxs {
+		if match == 1 {
+			continue
+		}
+		dst = append(dst, src[i])
+	}
+	tail := src[len(dst):]
+	clear(tail)
 	return dst
 }
 
