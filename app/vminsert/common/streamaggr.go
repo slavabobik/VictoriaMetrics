@@ -62,6 +62,7 @@ func CheckStreamAggrConfig() error {
 		DropInputLabels:      *streamAggrDropInputLabels,
 		IgnoreOldSamples:     *streamAggrIgnoreOldSamples,
 		IgnoreFirstIntervals: *streamAggrIgnoreFirstIntervals,
+		RWURL:                "global",
 	}
 	sas, err := streamaggr.LoadFromFile(*streamAggrConfig, pushNoop, opts)
 	if err != nil {
@@ -81,10 +82,11 @@ func HasStreamAggrConfigured() bool {
 // MustStopStreamAggr must be called when stream aggr is no longer needed.
 func InitStreamAggr() {
 	saCfgReloaderStopCh = make(chan struct{})
+	rwctx := "global"
 
 	if *streamAggrConfig == "" {
 		if *streamAggrDedupInterval > 0 {
-			deduplicator = streamaggr.NewDeduplicator(pushAggregateSeries, *streamAggrDedupInterval, *streamAggrDropInputLabels)
+			deduplicator = streamaggr.NewDeduplicator(pushAggregateSeries, *streamAggrDedupInterval, *streamAggrDropInputLabels, rwctx)
 		}
 		return
 	}
@@ -96,6 +98,7 @@ func InitStreamAggr() {
 		DropInputLabels:      *streamAggrDropInputLabels,
 		IgnoreOldSamples:     *streamAggrIgnoreOldSamples,
 		IgnoreFirstIntervals: *streamAggrIgnoreFirstIntervals,
+		RWURL:                rwctx,
 	}
 	sas, err := streamaggr.LoadFromFile(*streamAggrConfig, pushAggregateSeries, opts)
 	if err != nil {
@@ -130,6 +133,7 @@ func reloadStreamAggrConfig() {
 		DropInputLabels:      *streamAggrDropInputLabels,
 		IgnoreOldSamples:     *streamAggrIgnoreOldSamples,
 		IgnoreFirstIntervals: *streamAggrIgnoreFirstIntervals,
+		RWURL:                "global",
 	}
 	sasNew, err := streamaggr.LoadFromFile(*streamAggrConfig, pushAggregateSeries, opts)
 	if err != nil {

@@ -133,6 +133,12 @@ type Options struct {
 	//
 	// This option can be overridden individually per each aggregation via ignore_first_intervals option.
 	IgnoreFirstIntervals int
+
+	// RWURL name or url of remote write context
+	RWURL string
+
+	// aggrID id of aggregator
+	aggrID int
 }
 
 // Config is a configuration for a single stream aggregation.
@@ -250,8 +256,12 @@ func newAggregatorsFromData(data []byte, pushFunc PushFunc, opts *Options) (*Agg
 	}
 
 	ms := metrics.NewSet()
+	if opts == nil {
+		opts = &Options{}
+	}
 	as := make([]*aggregator, len(cfgs))
 	for i, cfg := range cfgs {
+		opts.aggrID = i + 1
 		a, err := newAggregator(cfg, pushFunc, ms, opts)
 		if err != nil {
 			// Stop already initialized aggregators before returning the error.
@@ -267,7 +277,8 @@ func newAggregatorsFromData(data []byte, pushFunc PushFunc, opts *Options) (*Agg
 		logger.Panicf("BUG: cannot marshal the provided configs: %s", err)
 	}
 
-	_ = ms.NewGauge(`vm_streamaggr_dedup_state_size_bytes`, func() float64 {
+	metricLabels := fmt.Sprintf("url=%q", opts.RWURL)
+	_ = ms.NewGauge(fmt.Sprintf(`vm_streamaggr_dedup_state_size_bytes{%s}`, metricLabels), func() float64 {
 		n := uint64(0)
 		for _, aggr := range as {
 			if aggr.da != nil {
@@ -276,7 +287,7 @@ func newAggregatorsFromData(data []byte, pushFunc PushFunc, opts *Options) (*Agg
 		}
 		return float64(n)
 	})
-	_ = ms.NewGauge(`vm_streamaggr_dedup_state_items_count`, func() float64 {
+	_ = ms.NewGauge(fmt.Sprintf(`vm_streamaggr_dedup_state_items_count{%s}`, metricLabels), func() float64 {
 		n := uint64(0)
 		for _, aggr := range as {
 			if aggr.da != nil {
@@ -395,6 +406,10 @@ type aggregator struct {
 	dedupFlushTimeouts *metrics.Counter
 	ignoredOldSamples  *metrics.Counter
 	ignoredNanSamples  *metrics.Counter
+	matchedSamples     *metrics.Counter
+	staleInputSamples  map[string]*metrics.Counter
+	staleOutputSamples map[string]*metrics.Counter
+	flushedSamples     map[string]*metrics.Counter
 }
 
 type aggrState interface {
@@ -415,10 +430,6 @@ type PushFunc func(tss []prompbmarshal.TimeSeries)
 //
 // The returned aggregator must be stopped when no longer needed by calling MustStop().
 func newAggregator(cfg *Config, pushFunc PushFunc, ms *metrics.Set, opts *Options) (*aggregator, error) {
-	if opts == nil {
-		opts = &Options{}
-	}
-
 	// check cfg.Interval
 	if cfg.Interval == "" {
 		return nil, fmt.Errorf("missing `interval` option")
@@ -586,13 +597,20 @@ func newAggregator(cfg *Config, pushFunc PushFunc, ms *metrics.Set, opts *Option
 
 	// initialize suffix to add to metric names after aggregation
 	suffix := ":" + cfg.Interval
+	group := "by time"
 	if labels := removeUnderscoreName(by); len(labels) > 0 {
+		group = fmt.Sprintf("by: %s", strings.Join(labels, ","))
 		suffix += fmt.Sprintf("_by_%s", strings.Join(labels, "_"))
 	}
 	if labels := removeUnderscoreName(without); len(labels) > 0 {
+		group = fmt.Sprintf("without: %s", strings.Join(labels, ","))
 		suffix += fmt.Sprintf("_without_%s", strings.Join(labels, "_"))
 	}
 	suffix += "_"
+
+	outputs := strings.Join(cfg.Outputs, ",")
+
+	metricLabels := fmt.Sprintf(`match=%q, group=%q, url=%q, position="%d"`, cfg.Match.ToLabelValue(), group, opts.RWURL, opts.aggrID)
 
 	// initialize the aggregator
 	a := &aggregator{
@@ -615,14 +633,26 @@ func newAggregator(cfg *Config, pushFunc PushFunc, ms *metrics.Set, opts *Option
 
 		stopCh: make(chan struct{}),
 
-		flushDuration:      ms.GetOrCreateHistogram(`vm_streamaggr_flush_duration_seconds`),
-		dedupFlushDuration: ms.GetOrCreateHistogram(`vm_streamaggr_dedup_flush_duration_seconds`),
-		samplesLag:         ms.GetOrCreateHistogram(`vm_streamaggr_samples_lag_seconds`),
+		flushDuration:      ms.GetOrCreateHistogram(fmt.Sprintf(`vm_streamaggr_flush_duration_seconds{outputs=%q, %s}`, outputs, metricLabels)),
+		dedupFlushDuration: ms.GetOrCreateHistogram(fmt.Sprintf(`vm_streamaggr_dedup_flush_duration_seconds{outputs=%q, %s}`, outputs, metricLabels)),
+		samplesLag:         ms.GetOrCreateHistogram(fmt.Sprintf(`vm_streamaggr_samples_lag_seconds{outputs=%q, %s}`, outputs, metricLabels)),
 
-		flushTimeouts:      ms.GetOrCreateCounter(`vm_streamaggr_flush_timeouts_total`),
-		dedupFlushTimeouts: ms.GetOrCreateCounter(`vm_streamaggr_dedup_flush_timeouts_total`),
-		ignoredNanSamples:  ms.GetOrCreateCounter(`vm_streamaggr_ignored_samples_total{reason="nan"}`),
-		ignoredOldSamples:  ms.GetOrCreateCounter(`vm_streamaggr_ignored_samples_total{reason="too_old"}`),
+		matchedSamples:     ms.GetOrCreateCounter(fmt.Sprintf(`vm_streamaggr_matched_samples_total{outputs=%q, %s}`, outputs, metricLabels)),
+		flushTimeouts:      ms.GetOrCreateCounter(fmt.Sprintf(`vm_streamaggr_flush_timeouts_total{outputs=%q, %s}`, outputs, metricLabels)),
+		dedupFlushTimeouts: ms.GetOrCreateCounter(fmt.Sprintf(`vm_streamaggr_dedup_flush_timeouts_total{outputs=%q, %s}`, outputs, metricLabels)),
+		ignoredNanSamples:  ms.GetOrCreateCounter(fmt.Sprintf(`vm_streamaggr_ignored_samples_total{reason="nan", outputs=%q, %s}`, outputs, metricLabels)),
+		ignoredOldSamples:  ms.GetOrCreateCounter(fmt.Sprintf(`vm_streamaggr_ignored_samples_total{reason="too_old", outputs=%q, %s}`, outputs, metricLabels)),
+		staleInputSamples:  make(map[string]*metrics.Counter, len(cfg.Outputs)),
+		staleOutputSamples: make(map[string]*metrics.Counter, len(cfg.Outputs)),
+		flushedSamples:     make(map[string]*metrics.Counter, len(cfg.Outputs)),
+	}
+	for _, output := range cfg.Outputs {
+		if ri := strings.IndexRune(output, '('); ri >= 0 {
+			output = output[:ri]
+		}
+		a.staleInputSamples[output] = ms.GetOrCreateCounter(fmt.Sprintf(`vm_streamaggr_stale_samples_total{key="input", output=%q, %s}`, output, metricLabels))
+		a.staleOutputSamples[output] = ms.GetOrCreateCounter(fmt.Sprintf(`vm_streamaggr_stale_samples_total{key="output", output=%q, %s}`, output, metricLabels))
+		a.flushedSamples[output] = ms.GetOrCreateCounter(fmt.Sprintf(`vm_streamaggr_flushed_samples_total{output=%q, %s}`, output, metricLabels))
 	}
 	if dedupInterval > 0 {
 		a.da = newDedupAggr()
@@ -875,7 +905,8 @@ func (a *aggregator) Push(tss []prompbmarshal.TimeSeries, matchIdxs []byte) {
 		}
 	}
 	if totalSamples > 0 {
-		a.samplesLag.Update(float64(totalLag/int64(totalSamples)) / 1000)
+		a.matchedSamples.Add(totalSamples)
+		a.samplesLag.Update(float64(totalLag/int64(totalSamples)) / 1_000)
 	}
 	ctx.samples = samples
 	ctx.buf = buf
@@ -1088,6 +1119,7 @@ func (ctx *flushCtx) appendSeries(key, suffix string, timestamp int64, value flo
 		Labels:  ctx.labels[labelsLen:],
 		Samples: ctx.samples[samplesLen:],
 	})
+	ctx.a.flushedSamples[suffix].Add(len(ctx.tss))
 
 	// Limit the maximum length of ctx.tss in order to limit memory usage.
 	if len(ctx.tss) >= 10_000 {
@@ -1115,6 +1147,7 @@ func (ctx *flushCtx) appendSeriesWithExtraLabel(key, suffix string, timestamp in
 		Labels:  ctx.labels[labelsLen:],
 		Samples: ctx.samples[samplesLen:],
 	})
+	ctx.a.flushedSamples[suffix].Add(len(ctx.tss))
 }
 
 func addMetricSuffix(labels []prompbmarshal.Label, offset int, firstSuffix, lastSuffix string) []prompbmarshal.Label {

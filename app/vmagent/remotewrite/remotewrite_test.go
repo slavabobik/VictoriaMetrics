@@ -79,7 +79,7 @@ func TestRemoteWriteContext_TryPush_ImmutableTimeseries(t *testing.T) {
 			rowsDroppedByRelabel:   metrics.GetOrCreateCounter(`bar`),
 		}
 		if dedupInterval > 0 {
-			rwctx.deduplicator = streamaggr.NewDeduplicator(nil, dedupInterval, nil)
+			rwctx.deduplicator = streamaggr.NewDeduplicator(nil, dedupInterval, nil, "global")
 		}
 
 		if len(streamAggrConfig) > 0 {

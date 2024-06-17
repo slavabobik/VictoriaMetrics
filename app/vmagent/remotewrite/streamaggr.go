@@ -132,14 +132,21 @@ func getStreamAggrOpts(idx int) (string, *streamaggr.Options) {
 			DropInputLabels:      *streamAggrGlobalDropInputLabels,
 			IgnoreOldSamples:     *streamAggrGlobalIgnoreOldSamples,
 			IgnoreFirstIntervals: *streamAggrGlobalIgnoreFirstIntervals,
+			RWURL:                "global",
 		}
+	}
+	url := fmt.Sprintf("%d:secret-url", idx+1)
+	if *showRemoteWriteURL {
+		url = fmt.Sprintf("%d:%s", idx+1, remoteWriteURLs.GetOptionalArg(idx))
 	}
 	opts := streamaggr.Options{
 		DedupInterval:        streamAggrDedupInterval.GetOptionalArg(idx),
 		DropInputLabels:      *streamAggrDropInputLabels,
 		IgnoreOldSamples:     streamAggrIgnoreOldSamples.GetOptionalArg(idx),
 		IgnoreFirstIntervals: *streamAggrIgnoreFirstIntervals,
+		RWURL:                url,
 	}
+
 	if len(*streamAggrConfig) == 0 {
 		return "", &opts
 	}

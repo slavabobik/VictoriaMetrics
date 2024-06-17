@@ -1,6 +1,7 @@
 package promrelabel
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 
@@ -8,6 +9,10 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/regexutil"
 	"github.com/VictoriaMetrics/metricsql"
+)
+
+const (
+	maxLabelValueLen = 64
 )
 
 // IfExpression represents PromQL-like label filters such as `metric_name{filters...}`.
@@ -38,6 +43,18 @@ func (ie *IfExpression) Match(labels []prompbmarshal.Label) bool {
 		}
 	}
 	return false
+}
+
+// ToLabelValue returns label value created from IfExpression
+func (ie *IfExpression) ToLabelValue() string {
+	if ie == nil || len(ie.ies) == 0 {
+		return ""
+	}
+	labelValue := ie.String()
+	if len(labelValue) > maxLabelValueLen {
+		labelValue = labelValue[:maxLabelValueLen-3] + "..."
+	}
+	return labelValue
 }
 
 // Parse parses ie from s.
@@ -143,7 +160,13 @@ func (ie *IfExpression) String() string {
 	if len(ie.ies) == 1 {
 		return ie.ies[0].String()
 	}
-	return fmt.Sprintf("%s", ie.ies)
+	var buf bytes.Buffer
+	buf.WriteString(ie.ies[0].String())
+	for _, e := range ie.ies[1:] {
+		buf.WriteString(",")
+		buf.WriteString(e.String())
+	}
+	return buf.String()
 }
 
 type ifExpression struct {

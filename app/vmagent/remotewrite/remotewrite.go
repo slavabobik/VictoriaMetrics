@@ -211,7 +211,7 @@ func Init() {
 		}
 		sasGlobal.Store(sas)
 	} else if sasOpts.DedupInterval > 0 {
-		deduplicatorGlobal = streamaggr.NewDeduplicator(pushToRemoteStoragesDropFailed, sasOpts.DedupInterval, sasOpts.DropInputLabels)
+		deduplicatorGlobal = streamaggr.NewDeduplicator(pushToRemoteStoragesDropFailed, sasOpts.DedupInterval, sasOpts.DropInputLabels, sasOpts.RWURL)
 	}
 
 	if len(*remoteWriteURLs) > 0 {
@@ -749,6 +749,7 @@ type remoteWriteCtx struct {
 	streamAggrDropInput   bool
 	disableOnDiskQueue    bool
 	dropSamplesOnOverload bool
+	url                   string
 
 	pss        []*pendingSeries
 	pssNextIdx atomic.Uint64
@@ -819,6 +820,7 @@ func newRemoteWriteCtx(argIdx int, remoteWriteURL *url.URL, maxInmemoryBlocks in
 
 		dropSamplesOnOverload: dropSamplesOnOverload.GetOptionalArg(argIdx),
 		disableOnDiskQueue:    isPQDisabled,
+		url:                   sanitizedURL,
 
 		rowsPushedAfterRelabel: metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_rows_pushed_after_relabel_total{path=%q, url=%q}`, queuePath, sanitizedURL)),
 		rowsDroppedByRelabel:   metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_relabel_metrics_dropped_total{path=%q, url=%q}`, queuePath, sanitizedURL)),
@@ -840,7 +842,7 @@ func newRemoteWriteCtx(argIdx int, remoteWriteURL *url.URL, maxInmemoryBlocks in
 		metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_streamaggr_config_reload_successful{path=%q}`, sasFile)).Set(1)
 		metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_streamaggr_config_reload_success_timestamp_seconds{path=%q}`, sasFile)).Set(fasttime.UnixTimestamp())
 	} else if sasOpts.DedupInterval > 0 {
-		rwctx.deduplicator = streamaggr.NewDeduplicator(rwctx.pushInternalTrackDropped, sasOpts.DedupInterval, sasOpts.DropInputLabels)
+		rwctx.deduplicator = streamaggr.NewDeduplicator(rwctx.pushInternalTrackDropped, sasOpts.DedupInterval, sasOpts.DropInputLabels, sasOpts.RWURL)
 	}
 
 	return rwctx
